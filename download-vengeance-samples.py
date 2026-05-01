@@ -5,17 +5,23 @@ from __future__ import annotations
 import argparse
 import curses
 import os
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import unquote_plus, urljoin
+from urllib.parse import unquote_plus, urldefrag, urljoin
 from urllib.request import Request, urlopen
 
 
 BASE_URL_DEFAULT = "https://files.lyberry.com/audio/sounds/Vengeance%20Samples/"
 DOWNLOAD_PATH_DEFAULT = "/mnt/c/Vengeance Samples"
 USER_AGENT = "some-scripts/1.0"
+
+
+def status(message: str) -> None:
+    print(message, flush=True)
 
 
 def clean_component(value: str) -> str:
@@ -56,15 +62,28 @@ def fetch_links(url: str) -> list[str]:
     parser.feed(html)
 
     filtered_links: list[str] = []
+    seen_links: set[str] = set()
     for href in parser.links:
+        if not href:
+            continue
+        href = urldefrag(href)[0].strip()
         if not href:
             continue
         if href.startswith("?"):
             continue
         if href.startswith("/"):
             continue
+        if href in {".", "./", ".."}:
+            continue
         if "../" in href:
             continue
+        while href.startswith("./"):
+            href = href[2:]
+        if not href:
+            continue
+        if href in seen_links:
+            continue
+        seen_links.add(href)
         filtered_links.append(href)
     return filtered_links
 
@@ -90,14 +109,33 @@ def list_root_directories(url: str) -> list[tuple[str, str]]:
     return root_directories
 
 
-def crawl_directory(url: str, relative_prefix: str = "") -> list[RemoteFile]:
+def crawl_directory(
+    url: str,
+    relative_prefix: str = "",
+    visited_directories: set[str] | None = None,
+    listed_directories: list[int] | None = None,
+) -> list[RemoteFile]:
+    if visited_directories is None:
+        visited_directories = set()
+    if listed_directories is None:
+        listed_directories = [0]
+
+    normalized_url = urldefrag(url)[0]
+    if normalized_url in visited_directories:
+        return []
+    visited_directories.add(normalized_url)
+    listed_directories[0] += 1
+
+    location = relative_prefix.rstrip("/") or "/"
+    status(f"  Listing remote directory [{listed_directories[0]}]: {location}")
+
     remote_files: list[RemoteFile] = []
 
     for href in fetch_links(url):
         full_url = urljoin(url, href)
         if href.endswith("/"):
             child_prefix = f"{relative_prefix}{sanitize_relative_path(href[:-1])}/"
-            remote_files.extend(crawl_directory(full_url, child_prefix))
+            remote_files.extend(crawl_directory(full_url, child_prefix, visited_directories, listed_directories))
             continue
 
         relative_path = f"{relative_prefix}{sanitize_relative_path(href)}"
@@ -151,7 +189,8 @@ def parse_directory_selection(raw_value: str, root_directories: list[tuple[str, 
         for directory_name, directory_url in root_directories
     }
 
-    for token in (part.strip() for part in raw_value.split(",")):
+    normalized_value = raw_value.replace(",", "\n")
+    for token in (part.strip() for part in normalized_value.splitlines()):
         if not token:
             continue
 
@@ -177,12 +216,46 @@ def parse_directory_selection(raw_value: str, root_directories: list[tuple[str, 
     return selected
 
 
-def select_root_directories(root_directories: list[tuple[str, str]]) -> list[tuple[str, str]]:
+def select_root_directories_with_fzf(root_directories: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    directory_names = [directory_name for directory_name, _ in root_directories]
+    choices = "\n".join(directory_names)
+    result = subprocess.run(
+        [
+            "fzf",
+            "--multi",
+            "--prompt",
+            "Directories> ",
+            "--header",
+            "Tab marks, Enter confirms",
+        ],
+        input=choices,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        raise ValueError("Selection cancelled by user.")
+
+    return parse_directory_selection(result.stdout, root_directories)
+
+
+def select_root_directories(root_directories: list[tuple[str, str]], selector_mode: str) -> list[tuple[str, str]]:
+    use_fzf = selector_mode in {"auto", "fzf"}
+    if use_fzf and shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
+        return select_root_directories_with_fzf(root_directories)
+
+    if selector_mode == "fzf":
+        raise ValueError("fzf selector requested, but fzf is not available in this terminal.")
+
     try:
-        if sys.stdin.isatty() and sys.stdout.isatty():
+        if selector_mode in {"auto", "curses"} and sys.stdin.isatty() and sys.stdout.isatty():
             return curses.wrapper(run_directory_selector, root_directories)
     except curses.error:
         pass
+
+    if selector_mode == "curses":
+        raise ValueError("curses selector requested, but no interactive terminal is available.")
 
     print_root_directories(root_directories)
     print("\nFallback mode: enter directory names separated by commas.")
@@ -353,6 +426,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=BASE_URL_DEFAULT, help="Base URL for the remote directory listing")
     parser.add_argument("--download-path", default=DOWNLOAD_PATH_DEFAULT, help="Local destination directory")
     parser.add_argument("--directories", help="Directories to download, comma-separated; accepts name or index")
+    parser.add_argument(
+        "--selector",
+        choices=("auto", "fzf", "curses", "prompt"),
+        default="auto",
+        help="Directory selector to use when --directories is not provided",
+    )
     parser.add_argument("--yes", action="store_true", help="Download without prompting for confirmation")
     parser.add_argument("--inventory-only", action="store_true", help="Only list missing files")
     return parser
@@ -365,7 +444,7 @@ def main() -> int:
     download_path = Path(os.path.expanduser(args.download_path))
     ensure_download_parent_exists(download_path)
 
-    print(f"Listing remote directories: {args.base_url}")
+    status(f"Listing remote directories: {args.base_url}")
     try:
         root_directories = list_root_directories(args.base_url)
     except Exception as exc:
@@ -380,21 +459,23 @@ def main() -> int:
         selected_directories = (
             parse_directory_selection(args.directories, root_directories)
             if args.directories
-            else select_root_directories(root_directories)
+            else select_root_directories(root_directories, args.selector)
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    print("\nSelected directories:")
+    status("\nSelected directories:")
     for directory_name, _ in selected_directories:
-        print(f"- {directory_name}")
+        status(f"- {directory_name}")
 
     remote_files: list[RemoteFile] = []
     for directory_name, directory_url in selected_directories:
-        print(f"Scanning directory: {directory_name}")
+        status(f"Scanning directory: {directory_name}")
         try:
+            before_count = len(remote_files)
             remote_files.extend(crawl_directory(directory_url, f"{directory_name}/"))
+            status(f"Finished directory: {directory_name} ({len(remote_files) - before_count} files found)")
         except Exception as exc:
             print(f"Failed to scan directory {directory_name}: {exc}", file=sys.stderr)
             return 1
