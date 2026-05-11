@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import curses
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -18,6 +20,9 @@ from urllib.request import Request, urlopen
 BASE_URL_DEFAULT = "https://files.lyberry.com/audio/sounds/Vengeance%20Samples/"
 DOWNLOAD_PATH_DEFAULT = "/mnt/c/Vengeance Samples"
 USER_AGENT = "some-scripts/1.0"
+CACHE_DIR_DEFAULT = Path.home() / ".cache" / "some-scripts"
+ROOT_DIRECTORIES_CACHE_NAME = "vengeance-root-directories.json"
+INVENTORY_CACHE_DIR_NAME = "vengeance-inventories"
 
 
 def status(message: str) -> None:
@@ -88,6 +93,14 @@ def fetch_links(url: str) -> list[str]:
     return filtered_links
 
 
+def default_root_cache_path() -> Path:
+    return CACHE_DIR_DEFAULT / ROOT_DIRECTORIES_CACHE_NAME
+
+
+def default_inventory_cache_dir() -> Path:
+    return CACHE_DIR_DEFAULT / INVENTORY_CACHE_DIR_NAME
+
+
 @dataclass(frozen=True)
 class RemoteFile:
     relative_path: str
@@ -106,6 +119,64 @@ def list_root_directories(url: str) -> list[tuple[str, str]]:
         root_directories.append((directory_name, urljoin(url, href)))
 
     root_directories.sort(key=lambda item: item[0].lower())
+    return root_directories
+
+
+def load_cached_root_directories(cache_path: Path, expected_url: str) -> list[tuple[str, str]]:
+    with cache_path.open("r", encoding="utf-8") as cache_file:
+        payload = json.load(cache_file)
+
+    if payload.get("base_url") != expected_url:
+        raise ValueError("cache was created for a different base URL")
+
+    directories = payload.get("directories")
+    if not isinstance(directories, list):
+        raise ValueError("cache does not contain a valid directory list")
+
+    cached_root_directories: list[tuple[str, str]] = []
+    for item in directories:
+        if not isinstance(item, dict):
+            raise ValueError("cache contains an invalid entry")
+        directory_name = item.get("name")
+        directory_url = item.get("url")
+        if not isinstance(directory_name, str) or not isinstance(directory_url, str):
+            raise ValueError("cache contains an invalid directory record")
+        cached_root_directories.append((directory_name, directory_url))
+
+    if not cached_root_directories:
+        raise ValueError("cache directory list is empty")
+
+    cached_root_directories.sort(key=lambda item: item[0].lower())
+    return cached_root_directories
+
+
+def save_cached_root_directories(cache_path: Path, base_url: str, root_directories: list[tuple[str, str]]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "base_url": base_url,
+        "directories": [
+            {"name": directory_name, "url": directory_url}
+            for directory_name, directory_url in root_directories
+        ],
+    }
+    with cache_path.open("w", encoding="utf-8") as cache_file:
+        json.dump(payload, cache_file, ensure_ascii=True, indent=2)
+        cache_file.write("\n")
+
+
+def get_root_directories(url: str, cache_path: Path, refresh_cache: bool) -> list[tuple[str, str]]:
+    if not refresh_cache and cache_path.is_file():
+        try:
+            cached_root_directories = load_cached_root_directories(cache_path, url)
+            status(f"Using cached root directories: {cache_path}")
+            return cached_root_directories
+        except Exception as exc:
+            status(f"Ignoring invalid root cache {cache_path}: {exc}")
+
+    status(f"Listing remote directories: {url}")
+    root_directories = list_root_directories(url)
+    save_cached_root_directories(cache_path, url, root_directories)
+    status(f"Saved root directory cache: {cache_path}")
     return root_directories
 
 
@@ -141,6 +212,73 @@ def crawl_directory(
         relative_path = f"{relative_prefix}{sanitize_relative_path(href)}"
         remote_files.append(RemoteFile(relative_path=relative_path, url=full_url))
 
+    return remote_files
+
+
+def inventory_cache_path(cache_dir: Path, directory_name: str, directory_url: str) -> Path:
+    slug = "".join(char if char.isalnum() else "-" for char in directory_name.lower()).strip("-")
+    slug = "-".join(part for part in slug.split("-") if part) or "directory"
+    cache_key = hashlib.sha1(directory_url.encode("utf-8")).hexdigest()[:12]
+    return cache_dir / f"{slug}-{cache_key}.json"
+
+
+def load_cached_inventory(cache_path: Path, expected_url: str) -> list[RemoteFile]:
+    with cache_path.open("r", encoding="utf-8") as cache_file:
+        payload = json.load(cache_file)
+
+    if payload.get("directory_url") != expected_url:
+        raise ValueError("cache was created for a different directory URL")
+
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise ValueError("cache does not contain a valid file list")
+
+    cached_files: list[RemoteFile] = []
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError("cache contains an invalid file entry")
+        relative_path = item.get("relative_path")
+        url = item.get("url")
+        if not isinstance(relative_path, str) or not isinstance(url, str):
+            raise ValueError("cache contains an invalid file record")
+        cached_files.append(RemoteFile(relative_path=relative_path, url=url))
+
+    return cached_files
+
+
+def save_cached_inventory(cache_path: Path, directory_url: str, remote_files: list[RemoteFile]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "directory_url": directory_url,
+        "files": [
+            {"relative_path": remote_file.relative_path, "url": remote_file.url}
+            for remote_file in remote_files
+        ],
+    }
+    with cache_path.open("w", encoding="utf-8") as cache_file:
+        json.dump(payload, cache_file, ensure_ascii=True, indent=2)
+        cache_file.write("\n")
+
+
+def get_directory_inventory(
+    directory_name: str,
+    directory_url: str,
+    cache_dir: Path,
+    refresh_cache: bool,
+) -> list[RemoteFile]:
+    cache_path = inventory_cache_path(cache_dir, directory_name, directory_url)
+    if not refresh_cache and cache_path.is_file():
+        try:
+            cached_files = load_cached_inventory(cache_path, directory_url)
+            status(f"Using cached inventory: {directory_name}")
+            return cached_files
+        except Exception as exc:
+            status(f"Ignoring invalid inventory cache {cache_path}: {exc}")
+
+    status(f"Scanning directory: {directory_name}")
+    remote_files = crawl_directory(directory_url, f"{directory_name}/")
+    save_cached_inventory(cache_path, directory_url, remote_files)
+    status(f"Saved inventory cache: {directory_name}")
     return remote_files
 
 
@@ -432,6 +570,26 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Directory selector to use when --directories is not provided",
     )
+    parser.add_argument(
+        "--root-cache",
+        default=str(default_root_cache_path()),
+        help="Path to the cached root directory list",
+    )
+    parser.add_argument(
+        "--refresh-root-cache",
+        action="store_true",
+        help="Ignore the cached root directory list and fetch it again from the remote server",
+    )
+    parser.add_argument(
+        "--inventory-cache-dir",
+        default=str(default_inventory_cache_dir()),
+        help="Directory used for cached per-folder inventories",
+    )
+    parser.add_argument(
+        "--refresh-inventory-cache",
+        action="store_true",
+        help="Ignore cached per-folder inventories and scan selected folders again",
+    )
     parser.add_argument("--yes", action="store_true", help="Download without prompting for confirmation")
     parser.add_argument("--inventory-only", action="store_true", help="Only list missing files")
     return parser
@@ -442,11 +600,12 @@ def main() -> int:
     args = parser.parse_args()
 
     download_path = Path(os.path.expanduser(args.download_path))
+    root_cache_path = Path(os.path.expanduser(args.root_cache))
+    inventory_cache_dir = Path(os.path.expanduser(args.inventory_cache_dir))
     ensure_download_parent_exists(download_path)
 
-    status(f"Listing remote directories: {args.base_url}")
     try:
-        root_directories = list_root_directories(args.base_url)
+        root_directories = get_root_directories(args.base_url, root_cache_path, args.refresh_root_cache)
     except Exception as exc:
         print(f"Failed to list remote directories: {exc}", file=sys.stderr)
         return 1
@@ -471,10 +630,16 @@ def main() -> int:
 
     remote_files: list[RemoteFile] = []
     for directory_name, directory_url in selected_directories:
-        status(f"Scanning directory: {directory_name}")
         try:
             before_count = len(remote_files)
-            remote_files.extend(crawl_directory(directory_url, f"{directory_name}/"))
+            remote_files.extend(
+                get_directory_inventory(
+                    directory_name,
+                    directory_url,
+                    inventory_cache_dir,
+                    args.refresh_inventory_cache,
+                )
+            )
             status(f"Finished directory: {directory_name} ({len(remote_files) - before_count} files found)")
         except Exception as exc:
             print(f"Failed to scan directory {directory_name}: {exc}", file=sys.stderr)

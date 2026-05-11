@@ -21,6 +21,10 @@ python3 download-vengeance-samples.py --directories "House Essentials,Minimal"
 
 When run without `--directories`, the Python script opens an interactive terminal selector for the root directories listed at the remote URL.
 
+The root directory list is cached locally after the first successful fetch, so later runs can open the selector without waiting for the remote index again. Use `--refresh-root-cache` when you want to rebuild that list.
+
+After you choose folders, each folder inventory is also cached locally. If the remote content rarely changes, later runs can skip the recursive scan and jump straight to the missing-file comparison.
+
 Controls:
 
 - `Up` / `Down`: move through the list.
@@ -47,5 +51,9 @@ If the terminal does not support `curses`, the script falls back to a simple pro
 - `--base-url`: override the base URL for the remote directory listing.
 - `--download-path`: override the local destination directory.
 - `--directories`: provide directories to download as a comma-separated list; accepts names or numeric indexes.
+- `--root-cache`: override the cache file used for the root directory list.
+- `--refresh-root-cache`: force a fresh fetch of the root directory list before showing the selector.
+- `--inventory-cache-dir`: override the directory used for cached folder inventories.
+- `--refresh-inventory-cache`: force a fresh recursive scan for the selected folders.
 - `--inventory-only`: only list missing files.
 - `--yes`: download without asking for confirmation.
