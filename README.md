@@ -2,6 +2,8 @@
 
 Utility scripts for inventorying and downloading samples from the Vengeance package.
 
+The Python script works on Linux and Windows. On Windows it defaults to `~/Downloads/Vengeance Samples`, and the `curses` selector stays optional.
+
 ## Files
 
 - `download-vengeance-samples.py`: main Python version, easier to maintain and extend.
@@ -19,24 +21,28 @@ python3 download-vengeance-samples.py --directories "House Essentials,Minimal"
 
 ## Interactive Selector
 
-When run without `--directories`, the Python script opens an interactive terminal selector for the root directories listed at the remote URL.
+When run without `--directories`, the Python script opens a native Python selector for the root directories listed at the remote URL.
 
-The root directory list is cached locally after the first successful fetch, so later runs can open the selector without waiting for the remote index again. Use `--refresh-root-cache` when you want to rebuild that list.
+The root directory list is cached in `vengeance-root-directories.json` inside this repository, so later runs can open the selector without waiting for the remote index again. If a folder is missing from the snapshot, the selector also exposes a `Load more from remote` option that refreshes this file.
 
 After you choose folders, each folder inventory is also cached locally. If the remote content rarely changes, later runs can skip the recursive scan and jump straight to the missing-file comparison.
 
 Controls:
 
-- `Up` / `Down`: move through the list.
-- `Space`: toggle the current directory.
-- `Enter`: confirm the selection.
-- Type text: filter directories by name.
-- `Backspace`: clear the last character from the filter.
-- `a`: select all currently visible directories.
-- `n`: clear all currently visible directories.
-- `q` or `Esc`: cancel.
+- `text`: filter directories by name.
+- `/text`: filter directories by name.
+- `1,2,3`: add visible directories by number.
+- `more`: show 50 more visible matches.
+- `clear`: reset the current filter.
+- `done`: confirm the accumulated selection.
+- `list`: show the current accumulated selection.
+- `reset`: clear the accumulated selection.
+- `remove 1,2`: remove items from the current selection by selection index.
+- `remove Exact Name`: remove an item from the current selection by exact selected name.
+- `load`: refresh the root directory snapshot from the server.
+- `q`: cancel.
 
-If the terminal does not support `curses`, the script falls back to a simple prompt where you can enter directory names separated by commas.
+If you prefer the older full-screen selector, use `--selector curses`. On Windows this depends on a Python installation that includes `curses`.
 
 ## Behavior
 

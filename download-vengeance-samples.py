@@ -3,26 +3,48 @@
 from __future__ import annotations
 
 import argparse
-import curses
 import hashlib
 import json
 import os
-import shutil
-import subprocess
 import sys
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote_plus, urldefrag, urljoin
 from urllib.request import Request, urlopen
 
+try:
+    import curses
+except ImportError:
+    curses = None
+
 
 BASE_URL_DEFAULT = "https://files.lyberry.com/audio/sounds/Vengeance%20Samples/"
-DOWNLOAD_PATH_DEFAULT = "/mnt/c/Vengeance Samples"
 USER_AGENT = "some-scripts/1.0"
-CACHE_DIR_DEFAULT = Path.home() / ".cache" / "some-scripts"
+PROJECT_DIR = Path(__file__).resolve().parent
 ROOT_DIRECTORIES_CACHE_NAME = "vengeance-root-directories.json"
 INVENTORY_CACHE_DIR_NAME = "vengeance-inventories"
+LOAD_MORE_LABEL = "[Load more from remote]"
+
+
+def default_download_path() -> str:
+    if os.name == "nt":
+        return str(Path.home() / "Downloads" / "Vengeance Samples")
+    return "/mnt/c/Vengeance Samples"
+
+
+def default_cache_dir() -> Path:
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "some-scripts"
+        return Path.home() / "AppData" / "Local" / "some-scripts"
+    return Path.home() / ".cache" / "some-scripts"
+
+
+DOWNLOAD_PATH_DEFAULT = default_download_path()
+CACHE_DIR_DEFAULT = default_cache_dir()
 
 
 def status(message: str) -> None:
@@ -94,7 +116,7 @@ def fetch_links(url: str) -> list[str]:
 
 
 def default_root_cache_path() -> Path:
-    return CACHE_DIR_DEFAULT / ROOT_DIRECTORIES_CACHE_NAME
+    return PROJECT_DIR / ROOT_DIRECTORIES_CACHE_NAME
 
 
 def default_inventory_cache_dir() -> Path:
@@ -178,6 +200,14 @@ def get_root_directories(url: str, cache_path: Path, refresh_cache: bool) -> lis
     save_cached_root_directories(cache_path, url, root_directories)
     status(f"Saved root directory cache: {cache_path}")
     return root_directories
+
+
+def load_more_entry() -> tuple[str, str]:
+    return (LOAD_MORE_LABEL, "")
+
+
+class LoadMoreRequested(ValueError):
+    pass
 
 
 def crawl_directory(
@@ -317,6 +347,7 @@ def print_root_directories(root_directories: list[tuple[str, str]]) -> None:
     print("\nDirectories available at the root:")
     for index, (directory_name, _) in enumerate(root_directories, start=1):
         print(f"{index}. {directory_name}")
+    print(f"{len(root_directories) + 1}. {LOAD_MORE_LABEL}")
 
 
 def parse_directory_selection(raw_value: str, root_directories: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -337,6 +368,10 @@ def parse_directory_selection(raw_value: str, root_directories: list[tuple[str, 
             index = int(token)
             if 1 <= index <= len(root_directories):
                 directory = root_directories[index - 1]
+            elif index == len(root_directories) + 1:
+                raise LoadMoreRequested
+        elif token.lower() in {LOAD_MORE_LABEL.lower(), "load more", "more"}:
+            raise LoadMoreRequested
         else:
             directory = directory_map.get(token.lower())
 
@@ -354,60 +389,227 @@ def parse_directory_selection(raw_value: str, root_directories: list[tuple[str, 
     return selected
 
 
-def select_root_directories_with_fzf(root_directories: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    directory_names = [directory_name for directory_name, _ in root_directories]
-    choices = "\n".join(directory_names)
-    result = subprocess.run(
-        [
-            "fzf",
-            "--multi",
-            "--prompt",
-            "Directories> ",
-            "--header",
-            "Tab marks, Enter confirms",
-        ],
-        input=choices,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+def parse_visible_directory_selection(raw_value: str, visible_directories: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    selected: list[tuple[str, str]] = []
+    seen_directory_names: set[str] = set()
+    directory_map = {
+        directory_name.lower(): (directory_name, directory_url)
+        for directory_name, directory_url in visible_directories
+    }
 
-    if result.returncode != 0:
-        raise ValueError("Selection cancelled by user.")
+    normalized_value = raw_value.replace(",", "\n")
+    for token in (part.strip() for part in normalized_value.splitlines()):
+        if not token:
+            continue
 
-    return parse_directory_selection(result.stdout, root_directories)
+        directory: tuple[str, str] | None = None
+        if token.isdigit():
+            index = int(token)
+            if 1 <= index <= len(visible_directories):
+                directory = visible_directories[index - 1]
+        else:
+            directory = directory_map.get(token.lower())
+
+        if directory is None:
+            raise ValueError(f"Invalid selection: {token}")
+
+        directory_name = directory[0]
+        if directory_name not in seen_directory_names:
+            selected.append(directory)
+            seen_directory_names.add(directory_name)
+
+    if not selected:
+        raise ValueError("No directories were selected.")
+
+    return selected
 
 
-def select_root_directories(root_directories: list[tuple[str, str]], selector_mode: str) -> list[tuple[str, str]]:
-    use_fzf = selector_mode in {"auto", "fzf"}
-    if use_fzf and shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
-        return select_root_directories_with_fzf(root_directories)
+def add_selected_directories(
+    selected_directories: list[tuple[str, str]],
+    new_directories: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    combined = list(selected_directories)
+    seen_directory_names = {directory_name for directory_name, _ in selected_directories}
+    for directory_name, directory_url in new_directories:
+        if directory_name in seen_directory_names:
+            continue
+        combined.append((directory_name, directory_url))
+        seen_directory_names.add(directory_name)
+    return combined
 
-    if selector_mode == "fzf":
-        raise ValueError("fzf selector requested, but fzf is not available in this terminal.")
 
-    try:
-        if selector_mode in {"auto", "curses"} and sys.stdin.isatty() and sys.stdout.isatty():
-            return curses.wrapper(run_directory_selector, root_directories)
-    except curses.error:
-        pass
+def remove_selected_directories(
+    selected_directories: list[tuple[str, str]],
+    raw_value: str,
+) -> list[tuple[str, str]]:
+    selected_by_name = {
+        directory_name.lower(): (directory_name, directory_url)
+        for directory_name, directory_url in selected_directories
+    }
+    directories_to_remove: set[str] = set()
 
-    if selector_mode == "curses":
-        raise ValueError("curses selector requested, but no interactive terminal is available.")
+    normalized_value = raw_value.replace(",", "\n")
+    for token in (part.strip() for part in normalized_value.splitlines()):
+        if not token:
+            continue
 
-    print_root_directories(root_directories)
-    print("\nFallback mode: enter directory names separated by commas.")
+        if token.isdigit():
+            index = int(token)
+            if 1 <= index <= len(selected_directories):
+                directories_to_remove.add(selected_directories[index - 1][0])
+                continue
+        else:
+            directory = selected_by_name.get(token.lower())
+            if directory is not None:
+                directories_to_remove.add(directory[0])
+                continue
+
+        raise ValueError(f"Invalid removal: {token}")
+
+    if not directories_to_remove:
+        raise ValueError("No directories were removed.")
+
+    return [
+        directory
+        for directory in selected_directories
+        if directory[0] not in directories_to_remove
+    ]
+
+
+def select_root_directories_with_prompt(
+    root_directories: list[tuple[str, str]],
+    base_url: str,
+    root_cache_path: Path,
+) -> list[tuple[str, str]]:
+    search_term = ""
+    visible_limit = 50
+    selected_directories: list[tuple[str, str]] = []
 
     while True:
+        filtered_indexes = filter_root_directories(root_directories, search_term)
+        visible_indexes = filtered_indexes[:visible_limit]
+        visible_directories = [root_directories[index] for index in visible_indexes]
+
+        print()
+        if search_term:
+            print(f"Search: {search_term}")
+        print(f"Selected directories: {len(selected_directories)}")
+        if selected_directories:
+            preview = ", ".join(directory_name for directory_name, _ in selected_directories[:5])
+            if len(selected_directories) > 5:
+                preview += ", ..."
+            print(f"Current selection: {preview}")
+        print(f"Visible directories: {len(visible_directories)} of {len(filtered_indexes)} matches")
+        for visible_index, directory_index in enumerate(visible_indexes, start=1):
+            print(f"{visible_index}. {root_directories[directory_index][0]}")
+        if len(filtered_indexes) > visible_limit:
+            print(f"{len(visible_directories) + 1}. More results...")
+        print(f"{len(visible_directories) + 2}. {LOAD_MORE_LABEL}")
+        print("Commands: text filters, /text filters, more shows more, clear resets filter")
+        print("Commands: done confirms, list shows selection, reset clears selection, load refreshes, q cancels")
+        print("Commands: remove 1,2 or remove exact name removes from the current selection")
+        print("Selections are accumulated. Use visible numbers or exact visible names; comma-separated works.")
+
         answer = input("Directories: ").strip()
+        lowered_answer = answer.lower()
+
+        if lowered_answer in {"q", "quit", "exit"}:
+            raise ValueError("Selection cancelled by user.")
+        if lowered_answer in {"done", "ok", "confirm"}:
+            if not selected_directories:
+                print("Error: no directories selected yet.")
+                continue
+            return selected_directories
+        if lowered_answer in {"list", "ls"}:
+            if not selected_directories:
+                print("No directories selected yet.")
+                continue
+            print("\nSelected directories:")
+            for index, (directory_name, _) in enumerate(selected_directories, start=1):
+                print(f"{index}. {directory_name}")
+            continue
+        if lowered_answer in {"reset", "clear selection"}:
+            selected_directories = []
+            continue
+        if lowered_answer.startswith("remove "):
+            try:
+                selected_directories = remove_selected_directories(selected_directories, answer[7:].strip())
+            except ValueError as exc:
+                print(f"Error: {exc}")
+            continue
+        if lowered_answer in {"clear", "/"}:
+            search_term = ""
+            visible_limit = 50
+            continue
+        if lowered_answer in {"more", "+"}:
+            visible_limit += 50
+            continue
+        if lowered_answer in {"load", "load more", "refresh"}:
+            root_directories = get_root_directories(base_url, root_cache_path, True)
+            search_term = ""
+            visible_limit = 50
+            continue
+        if answer.startswith("/"):
+            search_term = answer[1:].strip()
+            visible_limit = 50
+            continue
+
+        if answer.isdigit():
+            index = int(answer)
+            if len(filtered_indexes) > visible_limit and index == len(visible_directories) + 1:
+                visible_limit += 50
+                continue
+            if index == len(visible_directories) + 2:
+                root_directories = get_root_directories(base_url, root_cache_path, True)
+                search_term = ""
+                visible_limit = 50
+                continue
+
         try:
-            return parse_directory_selection(answer, root_directories)
+            selected_directories = add_selected_directories(
+                selected_directories,
+                parse_visible_directory_selection(answer, visible_directories),
+            )
+            continue
         except ValueError as exc:
+            if "," not in answer and "\n" not in answer and not answer.isdigit():
+                search_term = answer
+                visible_limit = 50
+                continue
             print(f"Error: {exc}")
 
 
+def select_root_directories(
+    root_directories: list[tuple[str, str]],
+    selector_mode: str,
+    base_url: str,
+    root_cache_path: Path,
+) -> list[tuple[str, str]]:
+    if selector_mode == "curses" and curses is None:
+        raise ValueError("curses selector requested, but curses is not available on this Python installation.")
+
+    while True:
+        try:
+            if selector_mode == "curses" and sys.stdin.isatty() and sys.stdout.isatty():
+                return curses.wrapper(run_directory_selector, root_directories)
+        except LoadMoreRequested:
+            root_directories = get_root_directories(base_url, root_cache_path, True)
+            continue
+        except Exception as exc:
+            if curses is not None and isinstance(exc, curses.error):
+                if selector_mode == "curses":
+                    raise ValueError("curses selector requested, but no interactive terminal is available.") from None
+                return select_root_directories_with_prompt(root_directories, base_url, root_cache_path)
+            raise
+
+        if selector_mode == "curses":
+            raise ValueError("curses selector requested, but no interactive terminal is available.")
+
+        return select_root_directories_with_prompt(root_directories, base_url, root_cache_path)
+
+
 def draw_directory_selector(
-    screen: curses.window,
+    screen: Any,
     root_directories: list[tuple[str, str]],
     filtered_indexes: list[int],
     selected_indexes: set[int],
@@ -428,8 +630,11 @@ def draw_directory_selector(
     for row, filtered_position in enumerate(range(scroll_offset, end_index), start=2):
         directory_index = filtered_indexes[filtered_position]
         directory_name = root_directories[directory_index][0]
-        marker = "[x]" if directory_index in selected_indexes else "[ ]"
-        line = f"{marker} {directory_name}"
+        if directory_name == LOAD_MORE_LABEL:
+            line = directory_name
+        else:
+            marker = "[x]" if directory_index in selected_indexes else "[ ]"
+            line = f"{marker} {directory_name}"
         attributes = curses.A_REVERSE if filtered_position == current_index else curses.A_NORMAL
         screen.addnstr(row, 0, line, width - 1, attributes)
 
@@ -447,7 +652,7 @@ def filter_root_directories(root_directories: list[tuple[str, str]], search_term
     ]
 
 
-def run_directory_selector(screen: curses.window, root_directories: list[tuple[str, str]]) -> list[tuple[str, str]]:
+def run_directory_selector(screen: Any, root_directories: list[tuple[str, str]]) -> list[tuple[str, str]]:
     curses.curs_set(0)
     screen.keypad(True)
 
@@ -455,11 +660,12 @@ def run_directory_selector(screen: curses.window, root_directories: list[tuple[s
     scroll_offset = 0
     search_term = ""
     selected_indexes: set[int] = set()
+    displayed_root_directories = [*root_directories, load_more_entry()]
 
     while True:
         height, _ = screen.getmaxyx()
         visible_rows = max(1, height - 4)
-        filtered_indexes = filter_root_directories(root_directories, search_term)
+        filtered_indexes = filter_root_directories(displayed_root_directories, search_term)
 
         if not filtered_indexes:
             current_index = 0
@@ -474,7 +680,7 @@ def run_directory_selector(screen: curses.window, root_directories: list[tuple[s
 
         draw_directory_selector(
             screen,
-            root_directories,
+            displayed_root_directories,
             filtered_indexes,
             selected_indexes,
             current_index,
@@ -490,7 +696,11 @@ def run_directory_selector(screen: curses.window, root_directories: list[tuple[s
             continue
 
         if key == ord("a"):
-            selected_indexes.update(filtered_indexes)
+            selected_indexes.update(
+                index
+                for index in filtered_indexes
+                if displayed_root_directories[index][0] != LOAD_MORE_LABEL
+            )
             continue
 
         if key == ord("n"):
@@ -511,6 +721,8 @@ def run_directory_selector(screen: curses.window, root_directories: list[tuple[s
             if not filtered_indexes:
                 continue
             directory_index = filtered_indexes[current_index]
+            if displayed_root_directories[directory_index][0] == LOAD_MORE_LABEL:
+                continue
             if directory_index in selected_indexes:
                 selected_indexes.remove(directory_index)
             else:
@@ -518,9 +730,13 @@ def run_directory_selector(screen: curses.window, root_directories: list[tuple[s
             continue
 
         if key in (10, 13, curses.KEY_ENTER):
+            if filtered_indexes:
+                directory_index = filtered_indexes[current_index]
+                if displayed_root_directories[directory_index][0] == LOAD_MORE_LABEL and not selected_indexes:
+                    raise LoadMoreRequested
             if not selected_indexes:
                 continue
-            return [root_directories[index] for index in sorted(selected_indexes)]
+            return [displayed_root_directories[index] for index in sorted(selected_indexes)]
 
         if key in (27, ord("q")):
             raise ValueError("Selection cancelled by user.")
@@ -566,8 +782,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--directories", help="Directories to download, comma-separated; accepts name or index")
     parser.add_argument(
         "--selector",
-        choices=("auto", "fzf", "curses", "prompt"),
-        default="auto",
+        choices=("prompt", "curses"),
+        default="prompt",
         help="Directory selector to use when --directories is not provided",
     )
     parser.add_argument(
@@ -618,7 +834,7 @@ def main() -> int:
         selected_directories = (
             parse_directory_selection(args.directories, root_directories)
             if args.directories
-            else select_root_directories(root_directories, args.selector)
+            else select_root_directories(root_directories, args.selector, args.base_url, root_cache_path)
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
